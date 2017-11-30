@@ -72,11 +72,9 @@ class Trainer(object):
         self.stats['value_estimate'].append(value)
         self.stats['entropy'].append(ent)
         self.stats['learning_rate'].append(learn_rate)
-        # new_info = env.step(actions, value={brain_name: value})[brain_name]
-        # self.add_experiences(info, new_info, epsi, actions, a_dist, value)
-        return (epsi, actions, a_dist, value)
+        return (actions, (epsi, a_dist, value))
 
-    def add_experiences(self, info, next_info, epsi, actions, a_dist, value):
+    def add_experiences(self, info, next_info, actions, take_action_outputs):
         """
         Adds experiences to each agent's experience history.
         :param info: Current BrainInfo.
@@ -86,6 +84,7 @@ class Trainer(object):
         :param a_dist: Action probabilities.
         :param value: Value estimates.
         """
+        epsi, a_dist, value = take_action_outputs
         for (agent, history) in self.history_dict.items():
             if agent in info.agents:
                 idx = info.agents.index(agent)
