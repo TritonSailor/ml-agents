@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-from ppo.history import *
+from ppo.buffer import *
 
 
 class Trainer(object):
@@ -20,8 +20,11 @@ class Trainer(object):
                  'entropy': [], 'value_loss': [], 'policy_loss': [], 'learning_rate': []}
         self.stats = stats
         self.is_training = training
-        self.reset_buffers(info, total=True)
-        self.training_buffer = vectorize_history(empty_local_history({}))
+        # self.reset_buffers(info, total=True)
+        # self.training_buffer = vectorize_history(empty_local_history({}))
+        self.training_buffer = Buffer()
+        self.cumulative_rewards = {}
+        self.episode_steps = {}
         self.is_continuous = is_continuous
         self.use_observations = use_observations
         self.use_states = use_states
@@ -42,6 +45,7 @@ class Trainer(object):
         return new_mean, new_variance
 
     def take_action(self, info, env, brain_name, steps, normalize):
+        #This is not where these arguments should be
         """
         Decides actions given state/observation information, and takes them in environment.
         :param info: Current BrainInfo from environment.
@@ -72,6 +76,7 @@ class Trainer(object):
         self.stats['value_estimate'].append(value)
         self.stats['entropy'].append(ent)
         self.stats['learning_rate'].append(learn_rate)
+        #This cannot be in trainer
         new_info = env.step(actions, value={brain_name: value})[brain_name]
         self.add_experiences(info, new_info, epsi, actions, a_dist, value)
         return new_info
@@ -86,22 +91,44 @@ class Trainer(object):
         :param a_dist: Action probabilities.
         :param value: Value estimates.
         """
-        for (agent, history) in self.history_dict.items():
-            if agent in info.agents:
-                idx = info.agents.index(agent)
+        for agent_id in info.agents:
+            if agent_id in next_info.agents:
+                idx = info.agents.index(agent_id)
+                next_idx = idx = next_info.agents.index(agent_id)
                 if not info.local_done[idx]:
                     if self.use_observations:
-                        history['observations'].append([info.observations[0][idx]])
+                        self.training_buffer[agent_id]['observations'].append_element([info.observations[0][idx]])
                     if self.use_states:
-                        history['states'].append(info.states[idx])
+                        self.training_buffer[agent_id]['states'].append_element(info.states[idx])
                     if self.is_continuous:
-                        history['epsilons'].append(epsi[idx])
-                    history['actions'].append(actions[idx])
-                    history['rewards'].append(next_info.rewards[idx])
-                    history['action_probs'].append(a_dist[idx])
-                    history['value_estimates'].append(value[idx][0])
-                    history['cumulative_reward'] += next_info.rewards[idx]
-                    history['episode_steps'] += 1
+                        self.training_buffer[agent_id]['epsilons'].append_element(epsi[idx])
+                    self.training_buffer[agent_id]['actions'].append_element(actions[idx])
+                    self.training_buffer[agent_id]['rewards'].append_element(next_info.rewards[next_idx])
+                    self.training_buffer[agent_id]['action_probs'].append_element(a_dist[idx])
+                    self.training_buffer[agent_id]['value_estimates'].append_element(value[idx][0])
+                    if agent_id not in self.cumulative_rewards:
+                        self.cumulative_rewards[agent_id] = 0
+                    self.cumulative_rewards[agent_id] += next_info.rewards[next_idx]
+                    if agent_id not in self.episode_steps:
+                        self.episode_steps[agent_id] = 0
+                    self.episode_steps[agent_id] += 1
+
+        # for (agent, history) in self.history_dict.items():
+        #     if agent in info.agents:
+        #         idx = info.agents.index(agent)
+        #         if not info.local_done[idx]:
+        #             if self.use_observations:
+        #                 history['observations'].append([info.observations[0][idx]])
+        #             if self.use_states:
+        #                 history['states'].append(info.states[idx])
+        #             if self.is_continuous:
+        #                 history['epsilons'].append(epsi[idx])
+        #             history['actions'].append(actions[idx])
+        #             history['rewards'].append(next_info.rewards[idx])
+        #             history['action_probs'].append(a_dist[idx])
+        #             history['value_estimates'].append(value[idx][0])
+        #             history['cumulative_reward'] += next_info.rewards[idx]
+        #             history['episode_steps'] += 1
 
     def process_experiences(self, info, time_horizon, gamma, lambd):
         """
@@ -113,8 +140,8 @@ class Trainer(object):
         :param lambd: GAE factor.
         """
         for l in range(len(info.agents)):
-            if (info.local_done[l] or len(self.history_dict[info.agents[l]]['actions']) > time_horizon) and len(
-                    self.history_dict[info.agents[l]]['actions']) > 0:
+            if (info.local_done[l] or len(self.training_buffer[info.agents[l]]['actions']) > time_horizon) and len(
+                    self.training_buffer[info.agents[l]]['actions']) > 0:
                 if info.local_done[l]:
                     value_next = 0.0
                 else:
@@ -124,33 +151,59 @@ class Trainer(object):
                     if self.use_states:
                         feed_dict[self.model.state_in] = info.states
                     value_next = self.sess.run(self.model.value, feed_dict)[l]
-                history = vectorize_history(self.history_dict[info.agents[l]])
-                history['advantages'] = get_gae(rewards=history['rewards'],
-                                                value_estimates=history['value_estimates'],
-                                                value_next=value_next, gamma=gamma, lambd=lambd)
-                history['discounted_returns'] = history['advantages'] + history['value_estimates']
-                if len(self.training_buffer['actions']) > 0:
-                    append_history(global_buffer=self.training_buffer, local_buffer=history)
-                else:
-                    set_history(global_buffer=self.training_buffer, local_buffer=history)
-                self.history_dict[info.agents[l]] = empty_local_history(self.history_dict[info.agents[l]])
+                # history = vectorize_history(self.history_dict[info.agents[l]])
+                agent_id = info.agents[l]
+                self.training_buffer[agent_id]['advantages'].set(
+                    get_gae(
+                        rewards=self.training_buffer[agent_id]['rewards'].get_batch(),
+                        value_estimates=self.training_buffer[agent_id]['value_estimates'].get_batch(),
+                        value_next=value_next, gamma=gamma, lambd=lambd)
+                )
+                self.training_buffer[agent_id]['discounted_returns'].set( \
+                 self.training_buffer[agent_id]['advantages'].get_batch() \
+                 + self.training_buffer[agent_id]['value_estimates'].get_batch())
+                # if len(self.training_buffer['actions']) > 0:
+                #     append_history(global_buffer=self.training_buffer, local_buffer=history)
+                # else:
+                #     set_history(global_buffer=self.training_buffer, local_buffer=history)
+                try:
+                    self.training_buffer.append_global(agent_id)
+                except:
+                    print(self.training_buffer)
+                    raise
+                # self.history_dict[info.agents[l]] = empty_local_history(self.history_dict[info.agents[l]])
+                self.training_buffer[agent_id].reset_agent()
                 if info.local_done[l]:
-                    self.stats['cumulative_reward'].append(history['cumulative_reward'])
-                    self.stats['episode_length'].append(history['episode_steps'])
-                    history['cumulative_reward'] = 0
-                    history['episode_steps'] = 0
+                    # self.stats['cumulative_reward'].append(history['cumulative_reward'])
+                    # self.stats['episode_length'].append(history['episode_steps'])
+                    # history['cumulative_reward'] = 0
+                    # history['episode_steps'] = 0
+                    self.stats['cumulative_reward'].append(self.cumulative_rewards[agent_id])
+                    self.stats['episode_length'].append(self.episode_steps[agent_id])
+                    self.cumulative_rewards[agent_id] = 0
+                    self.episode_steps[agent_id] = 0
 
-    def reset_buffers(self, brain_info=None, total=False):
-        """
-        Resets either all training buffers or local training buffers
-        :param brain_info: The BrainInfo object containing agent ids.
-        :param total: Whether to completely clear buffer.
-        """
-        if not total:
-            for key in self.history_dict:
-                self.history_dict[key] = empty_local_history(self.history_dict[key])
-        else:
-            self.history_dict = empty_all_history(agent_info=brain_info)
+
+    def reset_buffers(self):
+        self.training_buffer.reset_all()
+        for agent_id in self.cumulative_rewards:
+            self.cumulative_rewards[agent_id] = 0
+        for agent_id in self.episode_steps:
+            self.episode_steps[agent_id] = 0
+
+    # IsReadyForUpdate(self):
+
+    # def reset_buffers(self, brain_info=None, total=False):
+    #     """
+    #     Resets either all training buffers or local training buffers
+    #     :param brain_info: The BrainInfo object containing agent ids.
+    #     :param total: Whether to completely clear buffer.
+    #     """
+    #     if not total:
+    #         for key in self.history_dict:
+    #             self.history_dict[key] = empty_local_history(self.history_dict[key])
+    #     else:
+    #         self.history_dict = empty_all_history(agent_info=brain_info)
 
     def update_model(self, batch_size, num_epoch):
         """
@@ -159,31 +212,36 @@ class Trainer(object):
         :param num_epoch: How many passes through data to update model for.
         """
         total_v, total_p = 0, 0
-        advantages = self.training_buffer['advantages']
-        self.training_buffer['advantages'] = (advantages - advantages.mean()) / advantages.std()
+        # advantages = self.training_buffer['advantages']
+        advantages = self.training_buffer.global_buffer['advantages'].get_batch()
+        # self.training_buffer['advantages'] = (advantages - advantages.mean()) / advantages.std()
+        self.training_buffer.global_buffer['advantages'].set(
+           (advantages - advantages.mean()) / advantages.std())
         for k in range(num_epoch):
-            training_buffer = shuffle_buffer(self.training_buffer)
-            for l in range(len(training_buffer['actions']) // batch_size):
+            # training_buffer = shuffle_buffer(self.training_buffer)
+            self.training_buffer.global_buffer.shuffle()
+            for l in range(len(self.training_buffer.global_buffer['actions']) // batch_size):
                 start = l * batch_size
                 end = (l + 1) * batch_size
-                feed_dict = {self.model.returns_holder: training_buffer['discounted_returns'][start:end],
-                             self.model.advantage: np.vstack(training_buffer['advantages'][start:end]),
-                             self.model.old_probs: np.vstack(training_buffer['action_probs'][start:end])}
+                feed_dict = {self.model.returns_holder: self.training_buffer.global_buffer['discounted_returns'][start:end],
+                             self.model.advantage: np.vstack(self.training_buffer.global_buffer['advantages'][start:end]),
+                             self.model.old_probs: np.vstack(self.training_buffer.global_buffer['action_probs'][start:end])}
                 if self.is_continuous:
-                    feed_dict[self.model.epsilon] = np.vstack(training_buffer['epsilons'][start:end])
+                    feed_dict[self.model.epsilon] = np.vstack(self.training_buffer.global_buffer['epsilons'][start:end])
                 else:
-                    feed_dict[self.model.action_holder] = np.hstack(training_buffer['actions'][start:end])
+                    feed_dict[self.model.action_holder] = np.hstack(self.training_buffer.global_buffer['actions'][start:end])
                 if self.use_states:
-                    feed_dict[self.model.state_in] = np.vstack(training_buffer['states'][start:end])
+                    feed_dict[self.model.state_in] = np.vstack(self.training_buffer.global_buffer['states'][start:end])
                 if self.use_observations:
-                    feed_dict[self.model.observation_in] = np.vstack(training_buffer['observations'][start:end])
+                    feed_dict[self.model.observation_in] = np.vstack(self.training_buffer.global_buffer['observations'][start:end])
                 v_loss, p_loss, _ = self.sess.run([self.model.value_loss, self.model.policy_loss,
                                                    self.model.update_batch], feed_dict=feed_dict)
                 total_v += v_loss
                 total_p += p_loss
         self.stats['value_loss'].append(total_v)
         self.stats['policy_loss'].append(total_p)
-        self.training_buffer = vectorize_history(empty_local_history({}))
+        # self.training_buffer = vectorize_history(empty_local_history({}))
+        self.training_buffer.reset_global()
 
     def write_summary(self, summary_writer, steps, lesson_number):
         """

@@ -127,12 +127,14 @@ with tf.Session() as sess:
     while steps <= max_steps or not train_model:
         if env.global_done:
             info = env.reset(train_mode=train_model, progress=get_progress())[brain_name]
-            trainer.reset_buffers(info, total=True)
+            # trainer.reset_buffers(info, total=True)
+            trainer.reset_buffers()
         # Decide and take an action
         new_info = trainer.take_action(info, env, brain_name, steps, normalize)
         info = new_info
         trainer.process_experiences(info, time_horizon, gamma, lambd)
-        if len(trainer.training_buffer['actions']) > buffer_size and train_model:
+        # if len(trainer.training_buffer['actions']) > buffer_size and train_model:
+        if len(trainer.training_buffer.global_buffer['actions']) > buffer_size and train_model:
             # Perform gradient descent with experience buffer
             trainer.update_model(batch_size, num_epoch)
         if steps % summary_freq == 0 and steps != 0 and train_model:
