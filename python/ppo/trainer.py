@@ -1,33 +1,70 @@
 import numpy as np
 import tensorflow as tf
+import re
+import os
 
 from ppo.buffer import *
-
+from ppo.models import *
 
 class Trainer(object):
-    def __init__(self, ppo_model, sess, info, is_continuous, use_observations, use_states, training):
+    def __init__(self, sess, env, brain_name, trainer_parameters, training):
         """
         Responsible for collecting experiences and training PPO model.
-        :param ppo_model: Tensorflow graph defining model.
         :param sess: Tensorflow session.
-        :param info: Environment BrainInfo object.
-        :param is_continuous: Whether action-space is continuous.
-        :param use_observations: Whether agent takes image observations.
+        :param env: The UnityEnvironment.
+        :param  trainer_parameters: The parameters for the trainer (dictionary).
+        :param training: Whether the trainer is set for training.
         """
-        self.model = ppo_model
+        # self.model = ppo_model
+        # Might want to have multiple models here
+        with tf.variable_scope(re.sub('[^0-9a-zA-Z]+', '-', brain_name)):
+            self.model = create_agent_model(env, 
+                   lr=trainer_parameters['learning_rate'],
+                   h_size=trainer_parameters['hidden_units'],
+                   epsilon=trainer_parameters['epsilon'],
+                   beta=trainer_parameters['beta'], 
+                   max_step=trainer_parameters['max_steps'],
+                   normalize=trainer_parameters['normalize'],
+                   num_layers=trainer_parameters['num_layers'])
         self.sess = sess
         stats = {'cumulative_reward': [], 'episode_length': [], 'value_estimate': [],
                  'entropy': [], 'value_loss': [], 'policy_loss': [], 'learning_rate': []}
         self.stats = stats
         self.is_training = training
+        self.use_normalize = trainer_parameters['normalize']
         # self.reset_buffers(info, total=True)
         # self.training_buffer = vectorize_history(empty_local_history({}))
         self.training_buffer = Buffer()
         self.cumulative_rewards = {}
         self.episode_steps = {}
-        self.is_continuous = is_continuous
-        self.use_observations = use_observations
-        self.use_states = use_states
+        self.is_continuous = (env.brains[brain_name].action_space_type == "continuous")
+        self.use_observations = (env.brains[brain_name].number_observations > 0)
+        self.use_states = (env.brains[brain_name].state_space_size > 0)
+
+        self.summary_path = './summaries/{}'.format(trainer_parameters['run_path']+'_'+brain_name)
+        if not os.path.exists(self.summary_path):
+            os.makedirs(self.summary_path)
+        self.summary_writer = tf.summary.FileWriter(self.summary_path)
+        self.max_step = trainer_parameters['max_steps']
+        self.buffer_size = trainer_parameters['buffer_size']
+        self.batch_size = trainer_parameters['batch_size']
+        self.num_epoch = trainer_parameters['num_epoch']
+        self.summary_freq = trainer_parameters['summary_freq']
+
+    def get_step(self):
+        return self.sess.run(self.model.global_step)
+
+    def get_last_reward(self):
+        return self.sess.run(self.model.last_reward)
+
+    def increment_step(self):
+        self.sess.run(self.model.increment_step)
+
+    def update_last_reward(self):
+        if len(self.stats['cumulative_reward']) > 0:
+            mean_reward = np.mean(self.stats['cumulative_reward'])
+            self.sess.run(self.model.update_reward, feed_dict={self.model.new_reward: mean_reward})
+            last_reward = self.sess.run(self.model.last_reward)
 
     def running_average(self, data, steps, running_mean, running_variance):
         """
@@ -44,7 +81,7 @@ class Trainer(object):
         new_variance = var + (current_x - new_mean) * (current_x - mean)
         return new_mean, new_variance
 
-    def take_action(self, info, env, brain_name, steps, normalize):
+    def take_action(self, info, env, brain_name):
         #This is not where these arguments should be
         """
         Decides actions given state/observation information, and takes them in environment.
@@ -53,6 +90,7 @@ class Trainer(object):
         :param brain_name: Name of brain we are learning model for.
         :return: BrainInfo corresponding to new environment state.
         """
+        steps = self.get_step()
         epsi = None
         feed_dict = {self.model.batch_size: len(info.states)}
         run_list = [self.model.output, self.model.probs, self.model.value, self.model.entropy,
@@ -64,7 +102,7 @@ class Trainer(object):
             feed_dict[self.model.observation_in] = np.vstack(info.observations)
         if self.use_states:
             feed_dict[self.model.state_in] = info.states
-        if self.is_training and env.brains[brain_name].state_space_type == "continuous" and self.use_states and normalize:
+        if self.is_training and env.brains[brain_name].state_space_type == "continuous" and self.use_states and self.use_normalize:
             new_mean, new_variance = self.running_average(info.states, steps, self.model.running_mean,
                                                           self.model.running_variance)
             feed_dict[self.model.new_mean] = new_mean
@@ -77,20 +115,19 @@ class Trainer(object):
         self.stats['entropy'].append(ent)
         self.stats['learning_rate'].append(learn_rate)
         #This cannot be in trainer
-        new_info = env.step(actions, value={brain_name: value})[brain_name]
-        self.add_experiences(info, new_info, epsi, actions, a_dist, value)
-        return new_info
+        # new_info = env.step(actions, value={brain_name: value})[brain_name]
+        # self.add_experiences(info, new_info, epsi, actions, a_dist, value)
+        memories = None
+        return (actions, memories, value, (actions, epsi, a_dist, value))
 
-    def add_experiences(self, info, next_info, epsi, actions, a_dist, value):
+    def add_experiences(self, info, next_info, take_action_outputs):
         """
         Adds experiences to each agent's experience history.
         :param info: Current BrainInfo.
         :param next_info: Next BrainInfo.
-        :param epsi: Epsilon value (for continuous control)
-        :param actions: Chosen actions.
-        :param a_dist: Action probabilities.
-        :param value: Value estimates.
+        :param take_action_outputs: The outputs of the take action method.
         """
+        actions, epsi, a_dist, value = take_action_outputs
         for agent_id in info.agents:
             if agent_id in next_info.agents:
                 idx = info.agents.index(agent_id)
@@ -192,6 +229,8 @@ class Trainer(object):
             self.episode_steps[agent_id] = 0
 
     # IsReadyForUpdate(self):
+    def is_ready_update(self):
+        return len(self.training_buffer.global_buffer['actions']) > self.buffer_size
 
     # def reset_buffers(self, brain_info=None, total=False):
     #     """
@@ -205,12 +244,14 @@ class Trainer(object):
     #     else:
     #         self.history_dict = empty_all_history(agent_info=brain_info)
 
-    def update_model(self, batch_size, num_epoch):
+    def update_model(self):
         """
         Uses training_buffer to update model.
         :param batch_size: Size of each mini-batch update.
         :param num_epoch: How many passes through data to update model for.
         """
+        num_epoch = self.num_epoch
+        batch_size = self.batch_size
         total_v, total_p = 0, 0
         # advantages = self.training_buffer['advantages']
         advantages = self.training_buffer.global_buffer['advantages'].get_batch()
@@ -243,41 +284,41 @@ class Trainer(object):
         # self.training_buffer = vectorize_history(empty_local_history({}))
         self.training_buffer.reset_global()
 
-    def write_summary(self, summary_writer, steps, lesson_number):
+    def write_summary(self, lesson_number):
         """
         Saves training statistics to Tensorboard.
-        :param summary_writer: writer associated with Tensorflow session.
-        :param steps: Number of environment steps in training process.
+        :param lesson_number: The lesson the trainer is at.
         """
-        if len(self.stats['cumulative_reward']) > 0:
-            mean_reward = np.mean(self.stats['cumulative_reward'])
-            print("Step: {0}. Mean Reward: {1}. Std of Reward: {2}."
-                  .format(steps, mean_reward, np.std(self.stats['cumulative_reward'])))
-        summary = tf.Summary()
-        for key in self.stats:
-            if len(self.stats[key]) > 0:
-                stat_mean = float(np.mean(self.stats[key]))
-                summary.value.add(tag='Info/{}'.format(key), simple_value=stat_mean)
-                self.stats[key] = []
-        summary.value.add(tag='Info/Lesson', simple_value=lesson_number)
-        summary_writer.add_summary(summary, steps)
-        summary_writer.flush()
+        # print("write_summary", self.get_step() % self.summary_freq == 0 and self.get_step() != 0 and self.is_training, self.get_step())
+        if self.get_step() % self.summary_freq == 0 and self.get_step() != 0 and self.is_training:
+            steps = self.get_step()
+            if len(self.stats['cumulative_reward']) > 0:
+                mean_reward = np.mean(self.stats['cumulative_reward'])
+                print("Step: {0}. Mean Reward: {1}. Std of Reward: {2}."
+                      .format(steps, mean_reward, np.std(self.stats['cumulative_reward'])))
+            summary = tf.Summary()
+            for key in self.stats:
+                if len(self.stats[key]) > 0:
+                    stat_mean = float(np.mean(self.stats[key]))
+                    summary.value.add(tag='Info/{}'.format(key), simple_value=stat_mean)
+                    self.stats[key] = []
+            summary.value.add(tag='Info/Lesson', simple_value=lesson_number)
+            self.summary_writer.add_summary(summary, steps)
+            self.summary_writer.flush()
 
-    def write_text(self, summary_writer, key, input_dict, steps):
+    def write_text(self, key, input_dict):
         """
         Saves text to Tensorboard.
         Note: Only works on tensorflow r1.2 or above.
-        :param summary_writer: writer associated with Tensorflow session.
         :param key: The name of the text.
         :param input_dict: A dictionary that will be displayed in a table on Tensorboard.
-        :param steps: Number of environment steps in training process.
         """
         try:
             s_op = tf.summary.text(key,
                     tf.convert_to_tensor(([[str(x), str(input_dict[x])] for x in input_dict]))
                     )
             s = self.sess.run(s_op)
-            summary_writer.add_summary(s, steps)
+            self.summary_writer.add_summary(s, self.get_step())
         except:
             print("Cannot write text summary for Tensorboard. Tensorflow version must be r1.2 or above.")
             pass
