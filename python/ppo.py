@@ -109,7 +109,7 @@ if not os.path.exists(model_path):
 
 
 
-
+# Need to specify steps and last_reward here : Could be a sum of rewards or the min step ?
 def get_progress():
     if curriculum_file is not None:
         if env._curriculum.measure_type == "progress":
@@ -171,7 +171,7 @@ with tf.Session() as sess:
             take_action_outputs[brain_name]) = trainer.take_action(
                 info[brain], env, brain_name)
         # new_info = trainer.take_action(info, env, brain_name, steps, normalize)
-        new_info = env.step(action = take_action_actions, memory = None, value = take_action_values)
+        new_info = env.step(action = take_action_actions, memory = take_action_memories, value = take_action_values)
         for brain_name, trainer in trainers.iteritems():
             trainer.add_experiences(info[brain_name], new_info[brain_name], take_action_outputs[brain_name])
         info = new_info
@@ -195,10 +195,22 @@ with tf.Session() as sess:
         if global_step % save_freq == 0 and global_step != 0 and train_model:
             # Save Tensorflow model
             save_model(sess, model_path=model_path, steps=global_step, saver=saver)
+
+            graph_name = (env_name.strip()
+                  .replace('.app', '').replace('.exe', '').replace('.x86_64', '').replace('.x86', ''))
+            graph_name = os.path.basename(os.path.normpath(graph_name))
+            nodes = []
+            for brain in trainers.keys():
+                # The scope should be a Trainer property ?
+                scope = (re.sub('[^0-9a-zA-Z]+', '-', brain)) + '/'
+                nodes +=[scope + x for x in ["action","value_estimate","action_probs"]]
+            export_graph(model_path, graph_name, target_nodes=','.join(nodes))
+
     # Final save Tensorflow model
     if global_step != 0 and train_model:
         save_model(sess, model_path=model_path, steps=global_step, saver=saver)
 env.close()
+
 graph_name = (env_name.strip()
       .replace('.app', '').replace('.exe', '').replace('.x86_64', '').replace('.x86', ''))
 graph_name = os.path.basename(os.path.normpath(graph_name))
